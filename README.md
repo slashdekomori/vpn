@@ -6,7 +6,7 @@ tunnel, checks that the internet works, and rolls back with logs if it doesn't.
 ## Install
 
 ```bash
-cd ~/Projects/vpn
+git clone https://github.com/slashdekomori/vpn && cd vpn
 ./install.sh              # symlinks bin/vpn -> ~/.local/bin/vpn
 ./install.sh --nopasswd   # same + no sudo password for start/stop/restart
 ```
