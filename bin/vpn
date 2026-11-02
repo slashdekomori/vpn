@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# vpn — tiny wrapper around the sing-box systemd service
+set -u
+
+SVC=${VPN_SERVICE:-sing-box}
+CONF_DIR=${VPN_CONF_DIR:-/etc/sing-box}
+IFACE=${VPN_IFACE:-singtun}
+TIMEOUT=${VPN_TIMEOUT:-5}    # seconds per single connectivity probe
+WARMUP=${VPN_WARMUP:-30}     # seconds to keep retrying right after start
+
+c_red=$'\e[31m'; c_grn=$'\e[32m'; c_ylw=$'\e[33m'; c_dim=$'\e[2m'; c_bold=$'\e[1m'; c_off=$'\e[0m'
+ok()   { echo "${c_grn}✔${c_off} $*"; }
+warn() { echo "${c_ylw}!${c_off} $*"; }
+err()  { echo "${c_red}✘${c_off} $*" >&2; }
+
+usage() {
+    cat <<EOF
+${c_bold}vpn${c_off} — control the sing-box VPN
+
+${c_bold}Usage:${c_off} vpn [command]
+
+${c_bold}Commands:${c_off}
+  (none), t, toggle   turn on if off, off if on
+  on,  up,   start    validate config, start, wait for tunnel, test connection
+                      (auto-stops and shows logs if it doesn't come up)
+  off, down, stop     stop and test the direct connection
+  r,   restart        restart and test
+  s,   status         service state + current IP / country
+  c,   check          only test the connection
+  l,   log            follow sing-box logs (journalctl -fu)
+  e,   edit           edit config.json, then validate it
+  h,   help           show this help
+
+${c_bold}Environment overrides:${c_off}
+  VPN_SERVICE=$SVC  VPN_CONF_DIR=$CONF_DIR  VPN_IFACE=$IFACE
+  VPN_TIMEOUT=$TIMEOUT  VPN_WARMUP=$WARMUP
+EOF
+}
+
+is_up() { systemctl is-active --quiet "$SVC"; }
+
+ipinfo() {
+    curl -fsS -m "$TIMEOUT" https://ipinfo.io/json 2>/dev/null |
+        sed -nE 's/^ *"(ip|country|city|org)": "([^"]*)".*/\2/p' | paste -sd' '
+}
+
+check() {
+    local info
+    if info=$(ipinfo) && [[ -n $info ]]; then
+        ok "internet: $info"
+        if ping -c1 -W3 1.1.1.1 &>/dev/null; then ok "ping 1.1.1.1"; else warn "ping 1.1.1.1 failed (ICMP may just be blocked)"; fi
+        return 0
+    fi
+    err "no internet (ipinfo.io unreachable)"
+    return 1
+}
+
+# DNS/connectivity is often flaky for the first seconds after start: retry until WARMUP.
+check_warmup() {
+    local deadline=$((SECONDS + WARMUP)) info
+    printf '%s' "${c_dim}waiting for connection${c_off}"
+    while ((SECONDS < deadline)); do
+        is_up || break
+        if info=$(ipinfo) && [[ -n $info ]]; then
+            printf ' %s\n' "${c_dim}(${SECONDS}s)${c_off}"
+            check
+            return
+        fi
+        printf '.'
+        sleep 1
+    done
+    echo
+    check
+}
+
+logs() { journalctl -u "$SVC" --no-pager -o cat -n "${1:-25}" --since "-2min"; }
+
+wait_iface() {
+    local deadline=$((SECONDS + 10))
+    while ((SECONDS < deadline)); do
+        ip link show "$IFACE" &>/dev/null && return 0
+        is_up || return 1
+        sleep 0.2
+    done
+    return 1
+}
+
+start() {
+    if is_up; then warn "already running"; check; return; fi
+
+    if ! sing-box check -C "$CONF_DIR" 2>&1; then
+        err "config is invalid, not starting"; return 1
+    fi
+
+    echo "${c_dim}starting $SVC...${c_off}"
+    SECONDS=0
+    sudo systemctl start "$SVC" || { err "systemctl start failed"; logs; return 1; }
+
+    if ! wait_iface; then
+        err "tun interface '$IFACE' never came up"
+        logs; sudo systemctl stop "$SVC"; warn "stopped $SVC, back to direct"
+        return 1
+    fi
+
+    if check_warmup; then
+        ok "VPN is ${c_grn}ON${c_off}"
+    else
+        echo "${c_dim}--- recent sing-box log ---${c_off}"; logs
+        sudo systemctl stop "$SVC"
+        warn "stopped $SVC, checking direct connection..."
+        if check; then warn "direct works, so the problem is the proxy/server"
+        else err "direct is broken too, it's your network"; fi
+        return 1
+    fi
+}
+
+stop() {
+    is_up || { warn "not running"; check; return; }
+    sudo systemctl stop "$SVC" && ok "VPN is ${c_red}OFF${c_off}"
+    check
+}
+
+restart() {
+    SECONDS=0
+    sudo systemctl restart "$SVC" || { err "restart failed"; logs; return 1; }
+    wait_iface && check_warmup || { logs; return 1; }
+}
+
+status() {
+    if is_up; then ok "$SVC is running"; else warn "$SVC is stopped"; fi
+    check
+}
+
+case "${1:-toggle}" in
+    t|toggle)        if is_up; then stop; else start; fi ;;
+    on|up|start)     start ;;
+    off|down|stop)   stop ;;
+    r|restart)       restart ;;
+    s|status)        status ;;
+    c|check)         check ;;
+    l|log|logs)      journalctl -fu "$SVC" -o cat ;;
+    e|edit)          ${EDITOR:-nano} "$CONF_DIR/config.json" && sing-box check -C "$CONF_DIR" && ok "config ok" ;;
+    h|help|-h|--help) usage ;;
+    *) usage; exit 2 ;;
+esac

@@ -1,0 +1,3 @@
+# Allow controlling the sing-box service without a password prompt.
+# Install with: ./install.sh --nopasswd   (or see README.md)
+%USER% ALL=(root) NOPASSWD: /usr/bin/systemctl start sing-box, /usr/bin/systemctl stop sing-box, /usr/bin/systemctl restart sing-box
